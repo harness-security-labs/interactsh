@@ -159,14 +159,15 @@ func (h *DNSServer) ServeDNS(w dns.ResponseWriter, r *dns.Msg) {
 
 // isInConfiguredDomain reports whether name falls within one of the configured
 // domains, matching on label boundaries so that "evil-example.com" is not
-// treated as part of the "example.com" zone. ACME challenge names are always
-// accepted so certificate issuance keeps working.
+// treated as part of the "example.com" zone.
+//
+// ACME challenge names need no special case: certificates are requested for
+// "*.<configured domain>" (see HandleWildcardCertificates), so the challenge
+// name is always "_acme-challenge.<configured domain>" and is in zone already.
+// Exempting the "_acme-challenge." prefix outright would instead let any
+// foreign name be answered by prefixing it.
 func (h *DNSServer) isInConfiguredDomain(name string) bool {
 	fqdn := strings.ToLower(dns.Fqdn(name))
-
-	if strings.HasPrefix(fqdn, acme.DNSChallengeString) {
-		return true
-	}
 
 	for _, configuredDomain := range h.options.Domains {
 		dotDomain := strings.ToLower(dns.Fqdn(configuredDomain))
