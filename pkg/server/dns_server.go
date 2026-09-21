@@ -84,6 +84,28 @@ func (h *DNSServer) ServeDNS(w dns.ResponseWriter, r *dns.Msg) {
 		return
 	}
 
+	// Refuse anything outside the configured domains. Any depth of subdomain is
+	// in zone - that is the whole point of a collaborator - but foreign zones are
+	// not: interactions are only ever recorded for in-zone names (see
+	// handleInteraction), so answering them adds no capability and only turns the
+	// server into a DNS reflector. Every question is checked, since the handlers
+	// below answer each one and a single foreign question would otherwise slip
+	// through alongside an in-zone one.
+	if h.options.RestrictToDomains {
+		for _, question := range r.Question {
+			if h.isInConfiguredDomain(question.Name) {
+				continue
+			}
+			gologger.Debug().Msgf("Refusing out-of-zone DNS query for %s\n", question.Name)
+			m.Authoritative = false
+			m.Rcode = dns.RcodeRefused
+			if err := w.WriteMsg(m); err != nil {
+				gologger.Warning().Msgf("Could not write DNS refusal for %s: %s\n", question.Name, err)
+			}
+			return
+		}
+	}
+
 	isDNSChallenge := false
 	for _, question := range r.Question {
 		domain := question.Name
@@ -133,6 +155,28 @@ func (h *DNSServer) ServeDNS(w dns.ResponseWriter, r *dns.Msg) {
 	if err := w.WriteMsg(m); err != nil {
 		gologger.Warning().Msgf("Could not write DNS response: \n%s\n %s\n", m.String(), err)
 	}
+}
+
+// isInConfiguredDomain reports whether name falls within one of the configured
+// domains, matching on label boundaries so that "evil-example.com" is not
+// treated as part of the "example.com" zone.
+//
+// ACME challenge names need no special case: certificates are requested for
+// "*.<configured domain>" (see HandleWildcardCertificates), so the challenge
+// name is always "_acme-challenge.<configured domain>" and is in zone already.
+// Exempting the "_acme-challenge." prefix outright would instead let any
+// foreign name be answered by prefixing it.
+func (h *DNSServer) isInConfiguredDomain(name string) bool {
+	fqdn := strings.ToLower(dns.Fqdn(name))
+
+	for _, configuredDomain := range h.options.Domains {
+		dotDomain := strings.ToLower(dns.Fqdn(configuredDomain))
+		if fqdn == dotDomain || strings.HasSuffix(fqdn, "."+dotDomain) {
+			return true
+		}
+	}
+
+	return false
 }
 
 // handleACMETXTChallenge handles solving of ACME TXT challenge with the given provider
