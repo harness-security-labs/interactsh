@@ -140,6 +140,8 @@ GO111MODULE=on go get -v github.com/projectdiscovery/interactsh/cmd/interactsh-c
 interactsh-client -url https://example.com
 ```
 
+
+Restrict subdomain
 </details>
 
 ### Acknowledgement
