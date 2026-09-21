@@ -101,18 +101,18 @@ func TestServeDNSRestrictionDisabledPreservesLegacyBehaviour(t *testing.T) {
 // depth, since payload hostnames are generated per interaction.
 func TestServeDNSAnswersArbitrarySubdomains(t *testing.T) {
 	payloads := []string{
-		"c8dj4k2l9x.app.collab.tr4t.io.",
-		"cq7v0p2m1abcdefghij.app.collab.tr4t.io.",
-		"deep.nested.levels.of.subdomains.app.collab.tr4t.io.",
-		"with-hyphens-and-123.app.collab.tr4t.io.",
-		"MiXeDcAsE.app.collab.tr4t.io.",
-		"_acme-challenge.app.collab.tr4t.io.",
-		"app.collab.tr4t.io.",
+		"c8dj4k2l9x.app.mydomain.com.",
+		"cq7v0p2m1abcdefghij.app.mydomain.com.",
+		"deep.nested.levels.of.subdomains.app.mydomain.com.",
+		"with-hyphens-and-123.app.mydomain.com.",
+		"MiXeDcAsE.app.mydomain.com.",
+		"_acme-challenge.app.mydomain.com.",
+		"app.mydomain.com.",
 	}
 
 	for _, payload := range payloads {
 		opts := newTestOptions([]string{"54.245.113.160"}, "127.0.0.1")
-		opts.Domains = []string{"app.collab.tr4t.io"}
+		opts.Domains = []string{"app.mydomain.com"}
 		opts.RestrictToDomains = true
 		opts.CorrelationIdLength = 20
 		opts.Stats = &Metrics{}
@@ -136,14 +136,14 @@ func TestServeDNSAnswersArbitrarySubdomains(t *testing.T) {
 func TestServeDNSAnswersSubdomainsForAllRecordTypes(t *testing.T) {
 	for _, qtype := range []uint16{dns.TypeA, dns.TypeAAAA, dns.TypeCNAME, dns.TypeANY, dns.TypeMX, dns.TypeNS, dns.TypeSOA, dns.TypeTXT} {
 		opts := newTestOptions([]string{"54.245.113.160"}, "127.0.0.1")
-		opts.Domains = []string{"app.collab.tr4t.io"}
+		opts.Domains = []string{"app.mydomain.com"}
 		opts.RestrictToDomains = true
 		opts.CorrelationIdLength = 20
 		opts.Stats = &Metrics{}
 		dnsServer := NewDNSServer("udp", opts)
 
 		req := new(dns.Msg)
-		req.SetQuestion("c8dj4k2l9x.app.collab.tr4t.io.", qtype)
+		req.SetQuestion("c8dj4k2l9x.app.mydomain.com.", qtype)
 
 		w := &captureResponseWriter{}
 		dnsServer.ServeDNS(w, req)
@@ -157,7 +157,7 @@ func TestServeDNSAnswersSubdomainsForAllRecordTypes(t *testing.T) {
 // An in-zone question must not smuggle a foreign one through alongside it.
 func TestServeDNSRefusesMixedInAndOutOfZoneQuestions(t *testing.T) {
 	opts := newTestOptions([]string{"54.245.113.160"}, "127.0.0.1")
-	opts.Domains = []string{"app.collab.tr4t.io"}
+	opts.Domains = []string{"app.mydomain.com"}
 	opts.RestrictToDomains = true
 	opts.CorrelationIdLength = 20
 	opts.Stats = &Metrics{}
@@ -167,7 +167,7 @@ func TestServeDNSRefusesMixedInAndOutOfZoneQuestions(t *testing.T) {
 	req.Id = dns.Id()
 	req.RecursionDesired = true
 	req.Question = []dns.Question{
-		{Name: "c8dj4k2l9x.app.collab.tr4t.io.", Qclass: dns.ClassINET, Qtype: dns.TypeA},
+		{Name: "c8dj4k2l9x.app.mydomain.com.", Qclass: dns.ClassINET, Qtype: dns.TypeA},
 		{Name: "google.com.", Qclass: dns.ClassINET, Qtype: dns.TypeA},
 	}
 
