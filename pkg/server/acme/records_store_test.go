@@ -169,14 +169,44 @@ func TestSharedProviderMissingAndCorruptZone(t *testing.T) {
 	provider := NewProvider(dir)
 	ctx := context.Background()
 
-	_, err := provider.GetRecords(ctx, "missing.example.com.")
+	missing := "missing.example.com."
+	_, err := provider.GetRecords(ctx, missing)
 	require.Error(t, err)
-	deleted, err := provider.DeleteRecords(ctx, "missing.example.com.", nil)
+	_, err = os.Stat(provider.zonePath(missing) + ".lock")
+	require.ErrorIs(t, err, os.ErrNotExist)
+
+	deleted, err := provider.DeleteRecords(ctx, missing, nil)
 	require.NoError(t, err)
 	require.Empty(t, deleted)
 
 	zone := "broken.example.com."
 	require.NoError(t, os.WriteFile(provider.zonePath(zone), []byte("{not-json"), 0o600))
+	lock, err := os.OpenFile(provider.zonePath(zone)+".lock", os.O_CREATE|os.O_RDWR, 0o600)
+	require.NoError(t, err)
+	require.NoError(t, lock.Close())
 	_, err = provider.GetRecords(ctx, zone)
 	require.Error(t, err)
+}
+
+func TestSharedProviderReadDoesNotCreateLockFiles(t *testing.T) {
+	dir := t.TempDir()
+	provider := NewProvider(dir)
+	ctx := context.Background()
+
+	zones := []string{
+		"_acme-challenge.one.example.com.",
+		"_acme-challenge.two.example.com.",
+	}
+	for _, zone := range zones {
+		_, err := provider.GetRecords(ctx, zone)
+		require.Error(t, err)
+		_, err = os.Stat(provider.zonePath(zone) + ".lock")
+		require.ErrorIs(t, err, os.ErrNotExist)
+		_, err = os.Stat(provider.zonePath(zone))
+		require.ErrorIs(t, err, os.ErrNotExist)
+	}
+
+	entries, err := os.ReadDir(dir)
+	require.NoError(t, err)
+	require.Empty(t, entries)
 }

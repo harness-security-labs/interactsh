@@ -149,11 +149,21 @@ func (p *Provider) getRecordsFile(zoneName string) ([]libdns.Record, error) {
 
 // withZoneFile holds an advisory lock for zone so pods sharing dir cannot
 // interleave a read with a replace of the TXT record.
+//
+// Only writers create the lock file. ServeDNS forwards every in-domain
+// _acme-challenge TXT query to a read, so creating a lock before the zone
+// exists would let an unauthenticated sender leave a permanent file per
+// unique name and exhaust inodes on the shared volume. Readers open the
+// existing lock without O_CREATE and fail when it is absent.
 func (p *Provider) withZoneFile(zoneName string, exclusive bool, fn func(*RecordStore) error) error {
 	if err := os.MkdirAll(p.dir, 0o755); err != nil {
 		return err
 	}
-	lockFile, err := os.OpenFile(p.zonePath(zoneName)+".lock", os.O_CREATE|os.O_RDWR, 0o600)
+	flags := os.O_RDWR
+	if exclusive {
+		flags |= os.O_CREATE
+	}
+	lockFile, err := os.OpenFile(p.zonePath(zoneName)+".lock", flags, 0o600)
 	if err != nil {
 		return err
 	}
