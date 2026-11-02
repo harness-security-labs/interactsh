@@ -53,6 +53,8 @@ type CLIServerOptions struct {
 	OriginIPHeader           string
 	DiskStorage              bool
 	DiskStoragePath          string
+	AcmeSharedStorage        bool
+	AcmeStoragePath          string
 	EnablePprof              bool
 	EnableMetrics            bool
 	Verbose                  bool

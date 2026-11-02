@@ -4,9 +4,13 @@ package acme
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
+	"os"
+	"path/filepath"
 	"strings"
 	"sync"
+	"syscall"
 
 	"github.com/libdns/libdns"
 )
@@ -18,10 +22,16 @@ type RecordStore struct {
 type Provider struct {
 	sync.Mutex
 	recordMap map[string]*RecordStore
+	// dir is a directory of per-zone JSON files. When set, records are read
+	// and written there under an exclusive file lock so every pod mounted on
+	// the same directory answers the DNS-01 TXT from the same data.
+	dir string
 }
 
-func NewProvider() *Provider {
-	return &Provider{Mutex: sync.Mutex{}, recordMap: make(map[string]*RecordStore)}
+// NewProvider returns an in-memory provider when dir is empty. A non-empty
+// dir is the shared record directory (one JSON file per zone).
+func NewProvider(dir string) *Provider {
+	return &Provider{Mutex: sync.Mutex{}, recordMap: make(map[string]*RecordStore), dir: dir}
 }
 
 func (p *Provider) getZoneRecords(_ context.Context, zoneName string) *RecordStore {
@@ -48,6 +58,9 @@ func (r *RecordStore) deleteRecords(recs []libdns.Record) []libdns.Record {
 }
 
 func (p *Provider) AppendRecords(ctx context.Context, zoneName string, recs []libdns.Record) ([]libdns.Record, error) {
+	if p.dir != "" {
+		return p.appendRecordsFile(zoneName, recs)
+	}
 	p.Lock()
 	defer p.Unlock()
 	zoneRecordStore := p.getZoneRecords(ctx, zoneName)
@@ -67,6 +80,9 @@ func (p *Provider) AppendRecords(ctx context.Context, zoneName string, recs []li
 }
 
 func (p *Provider) DeleteRecords(ctx context.Context, zoneName string, recs []libdns.Record) ([]libdns.Record, error) {
+	if p.dir != "" {
+		return p.deleteRecordsFile(zoneName, recs)
+	}
 	p.Lock()
 	defer p.Unlock()
 	zoneRecordStore := p.getZoneRecords(ctx, zoneName)
@@ -78,6 +94,9 @@ func (p *Provider) DeleteRecords(ctx context.Context, zoneName string, recs []li
 }
 
 func (p *Provider) GetRecords(ctx context.Context, zoneName string) ([]libdns.Record, error) {
+	if p.dir != "" {
+		return p.getRecordsFile(zoneName)
+	}
 	p.Lock()
 	defer p.Unlock()
 	records := p.getZoneRecords(ctx, zoneName)
@@ -85,6 +104,139 @@ func (p *Provider) GetRecords(ctx context.Context, zoneName string) ([]libdns.Re
 		return nil, fmt.Errorf("no records were found for %v", zoneName)
 	}
 	return records.entries, nil
+}
+
+func (p *Provider) appendRecordsFile(zoneName string, recs []libdns.Record) ([]libdns.Record, error) {
+	var stored []libdns.Record
+	err := p.withZoneFile(zoneName, true, func(store *RecordStore) error {
+		if store == nil {
+			store = &RecordStore{}
+		}
+		if strings.HasPrefix(strings.ToLower(zoneName), DNSChallengeString) {
+			store.entries = recs
+		} else {
+			store.entries = append(store.entries, recs...)
+		}
+		stored = copyRecords(store.entries)
+		return p.saveZone(zoneName, store)
+	})
+	return stored, err
+}
+
+func (p *Provider) deleteRecordsFile(zoneName string, recs []libdns.Record) ([]libdns.Record, error) {
+	var deleted []libdns.Record
+	err := p.withZoneFile(zoneName, true, func(store *RecordStore) error {
+		if store == nil {
+			return nil
+		}
+		deleted = store.deleteRecords(recs)
+		return p.saveZone(zoneName, store)
+	})
+	return deleted, err
+}
+
+func (p *Provider) getRecordsFile(zoneName string) ([]libdns.Record, error) {
+	var entries []libdns.Record
+	err := p.withZoneFile(zoneName, false, func(store *RecordStore) error {
+		if store == nil || len(store.entries) == 0 {
+			return fmt.Errorf("no records were found for %v", zoneName)
+		}
+		entries = copyRecords(store.entries)
+		return nil
+	})
+	return entries, err
+}
+
+// withZoneFile holds an advisory lock for zone so pods sharing dir cannot
+// interleave a read with a replace of the TXT record.
+func (p *Provider) withZoneFile(zoneName string, exclusive bool, fn func(*RecordStore) error) error {
+	if err := os.MkdirAll(p.dir, 0o755); err != nil {
+		return err
+	}
+	lockFile, err := os.OpenFile(p.zonePath(zoneName)+".lock", os.O_CREATE|os.O_RDWR, 0o600)
+	if err != nil {
+		return err
+	}
+	defer lockFile.Close()
+
+	how := syscall.LOCK_SH
+	if exclusive {
+		how = syscall.LOCK_EX
+	}
+	if err := syscall.Flock(int(lockFile.Fd()), how); err != nil {
+		return err
+	}
+	defer syscall.Flock(int(lockFile.Fd()), syscall.LOCK_UN)
+
+	store, err := p.loadZone(zoneName)
+	if err != nil {
+		return err
+	}
+	return fn(store)
+}
+
+func (p *Provider) zonePath(zoneName string) string {
+	name := strings.ToLower(strings.Trim(strings.TrimSpace(zoneName), "."))
+	name = strings.ReplaceAll(name, "/", "_")
+	if name == "" {
+		name = "root"
+	}
+	return filepath.Join(p.dir, name+".json")
+}
+
+func (p *Provider) loadZone(zoneName string) (*RecordStore, error) {
+	data, err := os.ReadFile(p.zonePath(zoneName))
+	if err != nil {
+		if os.IsNotExist(err) {
+			return nil, nil
+		}
+		return nil, err
+	}
+	if len(strings.TrimSpace(string(data))) == 0 {
+		return &RecordStore{}, nil
+	}
+	var rrs []libdns.RR
+	if err := json.Unmarshal(data, &rrs); err != nil {
+		return nil, err
+	}
+	store := &RecordStore{entries: make([]libdns.Record, 0, len(rrs))}
+	for _, rr := range rrs {
+		store.entries = append(store.entries, rr)
+	}
+	return store, nil
+}
+
+func (p *Provider) saveZone(zoneName string, store *RecordStore) error {
+	rrs := make([]libdns.RR, 0, len(store.entries))
+	for _, rec := range store.entries {
+		rrs = append(rrs, rec.RR())
+	}
+	data, err := json.Marshal(rrs)
+	if err != nil {
+		return err
+	}
+	path := p.zonePath(zoneName)
+	tmp, err := os.CreateTemp(p.dir, "zone-*.json")
+	if err != nil {
+		return err
+	}
+	tmpName := tmp.Name()
+	if _, err := tmp.Write(data); err != nil {
+		tmp.Close()
+		os.Remove(tmpName)
+		return err
+	}
+	if err := tmp.Close(); err != nil {
+		os.Remove(tmpName)
+		return err
+	}
+	return os.Rename(tmpName, path)
+}
+
+func copyRecords(entries []libdns.Record) []libdns.Record {
+	out := make([]libdns.Record, len(entries))
+	copy(out, entries)
+	return out
 }
 
 var (
