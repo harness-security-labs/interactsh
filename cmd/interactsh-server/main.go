@@ -72,6 +72,8 @@ func main() {
 		flagSet.StringVarP(&cliOptions.DefaultHTTPResponseFile, "default-http-response", "dhr", "", "file to serve for all http requests (takes priority over other options)"),
 		flagSet.BoolVarP(&cliOptions.DiskStorage, "disk", "ds", false, "disk based storage"),
 		flagSet.StringVarP(&cliOptions.DiskStoragePath, "disk-path", "dsp", "", "disk storage path"),
+		flagSet.BoolVar(&cliOptions.AcmeSharedStorage, "acme-shared-storage", false, "share the ACME account, certificates, and DNS-01 TXT records across pods"),
+		flagSet.StringVar(&cliOptions.AcmeStoragePath, "acme-storage-path", "", "directory for shared ACME storage (required when acme-shared-storage is enabled)"),
 		flagSet.StringVarP(&cliOptions.HeaderServer, "server-header", "csh", "", "custom value of Server header in response"),
 		flagSet.BoolVarP(&cliOptions.NoVersionHeader, "disable-version", "dv", false, "disable publishing interactsh version in response header"),
 	)
@@ -282,7 +284,18 @@ func main() {
 		}
 	}
 
-	acmeStore := acme.NewProvider()
+	acmeDir := ""
+	if cliOptions.AcmeSharedStorage {
+		if cliOptions.AcmeStoragePath == "" {
+			gologger.Fatal().Msgf("acme storage path must be specified\n")
+		}
+		acmeDir = cliOptions.AcmeStoragePath
+		gologger.Info().Msgf("Using shared ACME storage at %s\n", acmeDir)
+	}
+	acmeStore, err := acme.UseSharedStorage(acmeDir)
+	if err != nil {
+		gologger.Fatal().Msgf("couldn't prepare ACME storage: %s\n", err)
+	}
 	serverOptions.ACMEStore = acmeStore
 
 	dnsTcpServer := server.NewDNSServer("tcp", serverOptions)

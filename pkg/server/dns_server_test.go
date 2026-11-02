@@ -1,9 +1,14 @@
 package server
 
 import (
+	"context"
 	"net"
+	"path/filepath"
 	"testing"
+	"time"
 
+	"github.com/caddyserver/certmagic"
+	"github.com/libdns/libdns"
 	"github.com/miekg/dns"
 	"github.com/projectdiscovery/interactsh/pkg/server/acme"
 	"github.com/stretchr/testify/require"
@@ -185,6 +190,36 @@ func hasRecord(rrs []dns.RR, rrtype uint16, expectedValue string) bool {
 		}
 	}
 	return false
+}
+
+func TestDNSServerAnswersChallengeFromSharedStore(t *testing.T) {
+	previous := certmagic.Default.Storage
+	t.Cleanup(func() { certmagic.Default.Storage = previous })
+
+	dir := t.TempDir()
+	writer, err := acme.UseSharedStorage(dir)
+	require.NoError(t, err)
+	reader, err := acme.UseSharedStorage(dir)
+	require.NoError(t, err)
+
+	zone := dns.Fqdn("_acme-challenge.example.com")
+	_, err = writer.AppendRecords(context.Background(), zone, []libdns.Record{
+		libdns.RR{Name: "@", Type: "TXT", Data: "dns-token", TTL: 45 * time.Second},
+	})
+	require.NoError(t, err)
+
+	opts := newTestOptions([]string{"192.0.2.1"}, "127.0.0.1")
+	opts.ACMEStore = reader
+	dnsServer := NewDNSServer("udp", opts)
+
+	msg := new(dns.Msg)
+	require.NoError(t, dnsServer.handleACMETXTChallenge(zone, msg))
+	require.Len(t, msg.Answer, 1)
+	txt, ok := msg.Answer[0].(*dns.TXT)
+	require.True(t, ok)
+	require.Equal(t, []string{"dns-token"}, txt.Txt)
+	require.Equal(t, zone, txt.Hdr.Name)
+	require.DirExists(t, filepath.Join(dir, "records"))
 }
 
 func newTestOptions(ips []string, listenIP string) *Options {

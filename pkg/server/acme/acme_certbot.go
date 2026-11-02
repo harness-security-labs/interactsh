@@ -23,6 +23,26 @@ var DefaultResolvers = []string{
 	"8.8.4.4:53",
 }
 
+// UseSharedStorage points certmagic and the DNS-01 record provider at dir.
+// Every pod that mounts dir then reuses the same account and certificate, and
+// whichever pod receives the challenge query can read the TXT record.
+// An empty dir keeps the in-memory provider and certmagic's default directory.
+func UseSharedStorage(dir string) (*Provider, error) {
+	if strings.TrimSpace(dir) == "" {
+		return NewProvider(""), nil
+	}
+	recordsDir := filepath.Join(dir, "records")
+	if err := os.MkdirAll(recordsDir, 0o755); err != nil {
+		return nil, err
+	}
+	certDir := filepath.Join(dir, "certificates")
+	if err := os.MkdirAll(certDir, 0o755); err != nil {
+		return nil, err
+	}
+	certmagic.Default.Storage = &certmagic.FileStorage{Path: certDir}
+	return NewProvider(recordsDir), nil
+}
+
 // CleanupStorage perform cleanup routines tasks
 func CleanupStorage() {
 	cleanupOptions := certmagic.CleanStorageOptions{OCSPStaples: true}
@@ -87,8 +107,7 @@ func HandleWildcardCertificates(domain, email string, store *Provider, debug boo
 	}
 
 	if creating {
-		home, _ := os.UserHomeDir()
-		gologger.Info().Msgf("Successfully Created SSL Certificate at: %s", filepath.Join(home, ".local", "share", "certmagic"))
+		gologger.Info().Msgf("Successfully Created SSL Certificate at: %s", certificateDir(cfg))
 	}
 
 	// attempts to extract certificates from caddy
@@ -128,6 +147,14 @@ func HandleWildcardCertificates(domain, email string, store *Provider, debug boo
 	}
 
 	return certs, certFiles, nil
+}
+
+func certificateDir(cfg *certmagic.Config) string {
+	if fileStorage, ok := cfg.Storage.(*certmagic.FileStorage); ok && fileStorage.Path != "" {
+		return fileStorage.Path
+	}
+	home, _ := os.UserHomeDir()
+	return filepath.Join(home, ".local", "share", "certmagic")
 }
 
 // certAlreadyExists returns true if a cert already exists
