@@ -96,12 +96,16 @@ func HandleWildcardCertificates(domain, email string, store *Provider, debug boo
 		gologger.Info().Msgf("Loading existing SSL Certificate for:  [%s, %s]", domain, originalDomain)
 	}
 
-	// this obtains certificates or renews them if necessary
-	if syncErr := cfg.ObtainCertSync(context.Background(), domain); syncErr != nil {
-		return nil, nil, syncErr
-	}
-
+	// Obtain each name before ManageSync. ObtainCertSync does not retry, and
+	// Let's Encrypt can return the certificate URL a moment before the
+	// certificate is readable ("Certificate not found"). A later obtain
+	// reads the certificate that is already issued.
 	domains := []string{domain, originalDomain}
+	for _, name := range domains {
+		if syncErr := obtainCertRetry(cfg, name); syncErr != nil {
+			return nil, nil, syncErr
+		}
+	}
 	if syncErr := cfg.ManageSync(context.Background(), domains); syncErr != nil {
 		gologger.Error().Msgf("Could not manage certmagic certs: %s", syncErr)
 	}
@@ -147,6 +151,29 @@ func HandleWildcardCertificates(domain, email string, store *Provider, debug boo
 	}
 
 	return certs, certFiles, nil
+}
+
+// obtainCertRetry repeats an obtain when the CA has issued the certificate
+// but the download still 404s. Other errors are returned immediately.
+func obtainCertRetry(cfg *certmagic.Config, name string) error {
+	const attempts = 4
+	var err error
+	for attempt := 1; attempt <= attempts; attempt++ {
+		err = cfg.ObtainCertSync(context.Background(), name)
+		if err == nil || !certNotReady(err) {
+			return err
+		}
+		if attempt == attempts {
+			break
+		}
+		gologger.Warning().Msgf("Certificate for %s is not readable yet, retrying: %v", name, err)
+		time.Sleep(time.Duration(attempt) * 2 * time.Second)
+	}
+	return err
+}
+
+func certNotReady(err error) bool {
+	return err != nil && strings.Contains(strings.ToLower(err.Error()), "certificate not found")
 }
 
 func certificateDir(cfg *certmagic.Config) string {
