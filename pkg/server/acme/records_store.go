@@ -167,7 +167,7 @@ func (p *Provider) withZoneFile(zoneName string, exclusive bool, fn func(*Record
 	if err != nil {
 		return err
 	}
-	defer lockFile.Close()
+	defer func() { _ = lockFile.Close() }()
 
 	how := syscall.LOCK_SH
 	if exclusive {
@@ -176,7 +176,7 @@ func (p *Provider) withZoneFile(zoneName string, exclusive bool, fn func(*Record
 	if err := syscall.Flock(int(lockFile.Fd()), how); err != nil {
 		return err
 	}
-	defer syscall.Flock(int(lockFile.Fd()), syscall.LOCK_UN)
+	defer func() { _ = syscall.Flock(int(lockFile.Fd()), syscall.LOCK_UN) }()
 
 	store, err := p.loadZone(zoneName)
 	if err != nil {
@@ -232,12 +232,12 @@ func (p *Provider) saveZone(zoneName string, store *RecordStore) error {
 	}
 	tmpName := tmp.Name()
 	if _, err := tmp.Write(data); err != nil {
-		tmp.Close()
-		os.Remove(tmpName)
+		_ = tmp.Close()
+		_ = os.Remove(tmpName)
 		return err
 	}
 	if err := tmp.Close(); err != nil {
-		os.Remove(tmpName)
+		_ = os.Remove(tmpName)
 		return err
 	}
 	return os.Rename(tmpName, path)
