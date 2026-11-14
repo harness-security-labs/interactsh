@@ -232,8 +232,147 @@ func newTestOptions(ips []string, listenIP string) *Options {
 	}
 
 	return &Options{
-		Domains:     []string{"example.com"},
-		IPAddresses: parsed,
-		ListenIP:    listenIP,
+		Domains:           []string{"example.com"},
+		IPAddresses:       parsed,
+		ListenIP:          listenIP,
+		RestrictToDomains: true,
 	}
+}
+
+func TestDNSServerRefusesOutOfZoneQueries(t *testing.T) {
+	opts := newTestOptions([]string{"192.0.2.1"}, "127.0.0.1")
+	dnsServer := NewDNSServer("udp", opts)
+
+	req := new(dns.Msg)
+	req.SetQuestion("anything.notours.org.", dns.TypeA)
+
+	rec := &testResponseWriter{}
+	dnsServer.ServeDNS(rec, req)
+
+	require.NotNil(t, rec.msg, "expected response message")
+	require.Equal(t, dns.RcodeRefused, rec.msg.Rcode, "out-of-zone queries must be refused")
+
+	for _, name := range []string{"fooexample.com.", "_acme-challenge.notours.org."} {
+		req = new(dns.Msg)
+		req.SetQuestion(name, dns.TypeA)
+		rec = &testResponseWriter{}
+		dnsServer.ServeDNS(rec, req)
+		require.NotNil(t, rec.msg)
+		require.Equal(t, dns.RcodeRefused, rec.msg.Rcode, name)
+	}
+
+	mixed := new(dns.Msg)
+	mixed.SetQuestion("a.example.com.", dns.TypeA)
+	mixed.Question = append(mixed.Question, dns.Question{Name: "fooexample.com.", Qtype: dns.TypeA, Qclass: dns.ClassINET})
+	rec = &testResponseWriter{}
+	dnsServer.ServeDNS(rec, mixed)
+	require.Equal(t, dns.RcodeRefused, rec.msg.Rcode, "one out-of-zone question refuses the message")
+
+	require.True(t, dnsServer.isConfiguredDomain("example.com."))
+	require.True(t, dnsServer.isConfiguredDomain("a.example.com."))
+	require.False(t, dnsServer.isConfiguredDomain("fooexample.com."))
+}
+
+func TestDNSServerToQTypeComprehensive(t *testing.T) {
+	testCases := []struct {
+		qtype    uint16
+		expected string
+	}{
+		{dns.TypeA, "A"},
+		{dns.TypeNS, "NS"},
+		{dns.TypeCNAME, "CNAME"},
+		{dns.TypeSOA, "SOA"},
+		{dns.TypePTR, "PTR"},
+		{dns.TypeMX, "MX"},
+		{dns.TypeTXT, "TXT"},
+		{dns.TypeAAAA, "AAAA"},
+		{65, "HTTPS"},
+		{dns.TypeCAA, "CAA"},
+		{dns.TypeSRV, "SRV"},
+		{dns.TypeANY, "ANY"},
+		{9999, "TYPE9999"},
+	}
+
+	for _, tc := range testCases {
+		require.Equal(t, tc.expected, toQType(tc.qtype))
+	}
+}
+
+type testResponseWriter struct {
+	dns.ResponseWriter
+	msg *dns.Msg
+}
+
+func (w *testResponseWriter) WriteMsg(m *dns.Msg) error {
+	w.msg = m
+	return nil
+}
+
+func (w *testResponseWriter) RemoteAddr() net.Addr {
+	return &net.UDPAddr{IP: net.ParseIP("127.0.0.1"), Port: 53535}
+}
+
+func TestDNSServerAAAAQueryIPv4OnlyReturnsNODATA(t *testing.T) {
+	opts := newTestOptions([]string{"192.0.2.10"}, "127.0.0.1")
+	dnsServer := NewDNSServer("udp", opts)
+
+	msg := new(dns.Msg)
+	msg.Question = []dns.Question{{Name: "sub.example.com.", Qtype: dns.TypeAAAA, Qclass: dns.ClassINET}}
+	rec := &testResponseWriter{}
+	dnsServer.ServeDNS(rec, msg)
+
+	require.Equal(t, dns.RcodeSuccess, rec.msg.Rcode)
+	require.Empty(t, rec.msg.Answer, "expected empty answer section for AAAA query when only IPv4 configured")
+	require.Len(t, rec.msg.Ns, 1, "expected SOA record in authority section")
+	soa, ok := rec.msg.Ns[0].(*dns.SOA)
+	require.True(t, ok, "expected SOA record type")
+	require.Equal(t, "example.com.", soa.Hdr.Name, "SOA record owner should be zone apex")
+}
+
+func TestDNSServerNSAuthorityOwnedByApex(t *testing.T) {
+	opts := newTestOptions([]string{"192.0.2.10"}, "127.0.0.1")
+	dnsServer := NewDNSServer("udp", opts)
+
+	msg := new(dns.Msg)
+	msg.Question = []dns.Question{{Name: "deep.sub.example.com.", Qtype: dns.TypeA, Qclass: dns.ClassINET}}
+	rec := &testResponseWriter{}
+	dnsServer.ServeDNS(rec, msg)
+
+	require.Equal(t, dns.RcodeSuccess, rec.msg.Rcode)
+	require.Len(t, rec.msg.Answer, 1)
+	require.NotEmpty(t, rec.msg.Ns, "expected NS records in authority section")
+	for _, rr := range rec.msg.Ns {
+		ns, ok := rr.(*dns.NS)
+		require.True(t, ok, "expected NS record")
+		require.Equal(t, "example.com.", ns.Hdr.Name, "NS record must be owned by zone apex, not queried name")
+	}
+}
+
+func TestDNSServerDualStackFiltersQuestionType(t *testing.T) {
+	opts := newTestOptions([]string{"192.0.2.10", "2001:db8::1"}, "127.0.0.1")
+	dnsServer := NewDNSServer("udp", opts)
+
+	// A query should return only A
+	msgA := new(dns.Msg)
+	msgA.Question = []dns.Question{{Name: "sub.example.com.", Qtype: dns.TypeA, Qclass: dns.ClassINET}}
+	recA := &testResponseWriter{}
+	dnsServer.ServeDNS(recA, msgA)
+	require.True(t, hasRecord(recA.msg.Answer, dns.TypeA, "192.0.2.10"))
+	require.False(t, hasRecord(recA.msg.Answer, dns.TypeAAAA, "2001:db8::1"))
+
+	// AAAA query should return only AAAA
+	msgAAAA := new(dns.Msg)
+	msgAAAA.Question = []dns.Question{{Name: "sub.example.com.", Qtype: dns.TypeAAAA, Qclass: dns.ClassINET}}
+	recAAAA := &testResponseWriter{}
+	dnsServer.ServeDNS(recAAAA, msgAAAA)
+	require.False(t, hasRecord(recAAAA.msg.Answer, dns.TypeA, "192.0.2.10"))
+	require.True(t, hasRecord(recAAAA.msg.Answer, dns.TypeAAAA, "2001:db8::1"))
+
+	// ANY query should return both A and AAAA
+	msgANY := new(dns.Msg)
+	msgANY.Question = []dns.Question{{Name: "sub.example.com.", Qtype: dns.TypeANY, Qclass: dns.ClassINET}}
+	recANY := &testResponseWriter{}
+	dnsServer.ServeDNS(recANY, msgANY)
+	require.True(t, hasRecord(recANY.msg.Answer, dns.TypeA, "192.0.2.10"))
+	require.True(t, hasRecord(recANY.msg.Answer, dns.TypeAAAA, "2001:db8::1"))
 }

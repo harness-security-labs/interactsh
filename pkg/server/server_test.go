@@ -9,6 +9,7 @@ import (
 
 func TestGetURLIDComponent(t *testing.T) {
 	options := Options{CorrelationIdLength: settings.CorrelationIdLengthDefault, CorrelationIdNonceLength: settings.CorrelationIdNonceLengthDefault}
-	random := options.getURLIDComponent("c6rj61aciaeutn2ae680cg5.ugboyyyyyn.interactsh.com")
-	require.Equal(t, "ugboyyyyyn", random, "could not get correct component")
+	id := defaultUniqueID()
+	random := options.getURLIDComponent(id + ".interactsh.com")
+	require.Equal(t, id, random, "could not get correct component")
 }

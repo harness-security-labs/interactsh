@@ -9,7 +9,6 @@ import (
 	"sync/atomic"
 	"time"
 
-	jsoniter "github.com/json-iterator/go"
 	"github.com/miekg/dns"
 	"github.com/pkg/errors"
 	"github.com/projectdiscovery/gologger"
@@ -73,7 +72,9 @@ func (h *DNSServer) ListenAndServe(dnsAlive chan bool) {
 
 // ServeDNS is the default handler for DNS queries.
 func (h *DNSServer) ServeDNS(w dns.ResponseWriter, r *dns.Msg) {
-	atomic.AddUint64(&h.options.Stats.Dns, 1)
+	if h.options.Stats != nil {
+		atomic.AddUint64(&h.options.Stats.Dns, 1)
+	}
 
 	m := new(dns.Msg)
 	m.SetReply(r)
@@ -84,16 +85,14 @@ func (h *DNSServer) ServeDNS(w dns.ResponseWriter, r *dns.Msg) {
 		return
 	}
 
-	// Refuse anything outside the configured domains. Any depth of subdomain is
-	// in zone - that is the whole point of a collaborator - but foreign zones are
-	// not: interactions are only ever recorded for in-zone names (see
-	// handleInteraction), so answering them adds no capability and only turns the
-	// server into a DNS reflector. Every question is checked, since the handlers
-	// below answer each one and a single foreign question would otherwise slip
-	// through alongside an in-zone one.
-	if h.options.RestrictToDomains {
+	// Refuse the whole message when any name is outside the configured zones.
+	// An ACME prefix does not bypass this: challenges for this server are in zone.
+	// Every question is checked, since the handlers below answer each one and a
+	// single foreign question would otherwise slip through alongside an in-zone one.
+	// RestrictToDomains can be disabled to restore answering any zone.
+	if h.options.RestrictToDomains && len(h.options.Domains) > 0 {
 		for _, question := range r.Question {
-			if h.isInConfiguredDomain(question.Name) {
+			if h.isConfiguredDomain(question.Name) {
 				continue
 			}
 			gologger.Debug().Msgf("Refusing out-of-zone DNS query for %s\n", question.Name)
@@ -113,7 +112,6 @@ func (h *DNSServer) ServeDNS(w dns.ResponseWriter, r *dns.Msg) {
 		// Handle DNS server cases for ACME server
 		if strings.HasPrefix(strings.ToLower(domain), acme.DNSChallengeString) {
 			isDNSChallenge = true
-
 			gologger.Debug().Msgf("Got acme dns request: \n%s\n", r.String())
 
 			switch question.Qtype {
@@ -160,23 +158,25 @@ func (h *DNSServer) ServeDNS(w dns.ResponseWriter, r *dns.Msg) {
 // isInConfiguredDomain reports whether name falls within one of the configured
 // domains, matching on label boundaries so that "evil-example.com" is not
 // treated as part of the "example.com" zone.
-//
-// ACME challenge names need no special case: certificates are requested for
-// "*.<configured domain>" (see HandleWildcardCertificates), so the challenge
-// name is always "_acme-challenge.<configured domain>" and is in zone already.
-// Exempting the "_acme-challenge." prefix outright would instead let any
-// foreign name be answered by prefixing it.
 func (h *DNSServer) isInConfiguredDomain(name string) bool {
-	fqdn := strings.ToLower(dns.Fqdn(name))
+	return h.isConfiguredDomain(name)
+}
 
+// isConfiguredDomain reports whether domain is exactly a configured domain or one of its subdomains.
+func (h *DNSServer) isConfiguredDomain(domain string) bool {
+	return h.matchingDomain(domain) != ""
+}
+
+// matchingDomain returns the configured domain that contains domain, using a label boundary.
+func (h *DNSServer) matchingDomain(domain string) string {
+	domain = dns.Fqdn(domain)
 	for _, configuredDomain := range h.options.Domains {
-		dotDomain := strings.ToLower(dns.Fqdn(configuredDomain))
-		if fqdn == dotDomain || strings.HasSuffix(fqdn, "."+dotDomain) {
-			return true
+		configuredDotDomain := dns.Fqdn(configuredDomain)
+		if strings.EqualFold(domain, configuredDotDomain) || stringsutil.HasSuffixI(domain, "."+configuredDotDomain) {
+			return configuredDomain
 		}
 	}
-
-	return false
+	return ""
 }
 
 // handleACMETXTChallenge handles solving of ACME TXT challenge with the given provider
@@ -221,20 +221,53 @@ func (h *DNSServer) handleACNAMEANY(zone string, m *dns.Msg) {
 }
 
 func (h *DNSServer) resultFunction(nsHeader dns.RR_Header, zone string, ipAddresses []net.IP, m *dns.Msg) {
+	qtype := uint16(dns.TypeANY)
+	if len(m.Question) > 0 {
+		qtype = m.Question[0].Qtype
+	}
+
 	unique := uniqueIPs(ipAddresses)
 	var answered bool
 	for _, ipAddress := range unique {
+		isV4 := ipAddress.To4() != nil
+		if (qtype == dns.TypeA && !isV4) || (qtype == dns.TypeAAAA && isV4) {
+			continue
+		}
 		if h.appendAnswerRecord(zone, ipAddress, m) {
 			answered = true
 		}
 	}
+
+	apex := ""
+	if matched := h.matchingDomain(zone); matched != "" {
+		apex = dns.Fqdn(matched)
+	} else if len(h.options.Domains) > 0 {
+		apex = dns.Fqdn(h.options.Domains[0])
+	} else {
+		apex = zone
+	}
+
 	if !answered {
+		// NODATA: return NOERROR with empty answer and SOA record in authority section
+		primaryNs := "ns1." + apex
+		if nsDomains, ok := h.nsDomains[apex]; ok && len(nsDomains) > 0 {
+			primaryNs = nsDomains[0]
+		}
+		m.Ns = append(m.Ns, &dns.SOA{
+			Hdr:    dns.RR_Header{Name: apex, Rrtype: dns.TypeSOA, Class: dns.ClassINET, Ttl: 60},
+			Ns:     primaryNs,
+			Mbox:   acme.CertificateAuthority,
+			Serial: 1,
+			Expire: 60,
+			Minttl: 60,
+		})
 		return
 	}
 
-	dotDomains := []string{zone, dns.Fqdn(h.options.Domains[0])}
+	dotDomains := []string{apex, zone}
 	for _, dotDomain := range dotDomains {
 		if nsDomains, ok := h.nsDomains[dotDomain]; ok {
+			nsHeader.Name = dotDomain
 			for _, nsDomain := range nsDomains {
 				m.Ns = append(m.Ns, &dns.NS{Hdr: nsHeader, Ns: nsDomain})
 				h.appendGlueRecords(nsDomain, m)
@@ -321,50 +354,22 @@ func (h *DNSServer) handleTXT(zone string, m *dns.Msg) {
 	m.Answer = append(m.Answer, &dns.TXT{Hdr: dns.RR_Header{Name: zone, Rrtype: dns.TypeTXT, Class: dns.ClassINET, Ttl: 0}, Txt: []string{h.TxtRecord}})
 }
 
-func toQType(ttype uint16) (rtype string) {
-	switch ttype {
-	case dns.TypeA:
-		rtype = "A"
-	case dns.TypeNS:
-		rtype = "NS"
-	case dns.TypeCNAME:
-		rtype = "CNAME"
-	case dns.TypeSOA:
-		rtype = "SOA"
-	case dns.TypePTR:
-		rtype = "PTR"
-	case dns.TypeMX:
-		rtype = "MX"
-	case dns.TypeTXT:
-		rtype = "TXT"
-	case dns.TypeAAAA:
-		rtype = "AAAA"
-	}
-	return
+func toQType(ttype uint16) string {
+	return dns.Type(ttype).String()
 }
 
 // handleInteraction handles an interaction for the DNS server
 func (h *DNSServer) handleInteraction(domain string, w dns.ResponseWriter, r *dns.Msg, m *dns.Msg) {
-	var uniqueID, fullID string
-
 	requestMsg := r.String()
 	responseMsg := m.String()
 
 	gologger.Debug().Msgf("New DNS request: %s\n", requestMsg)
 
-	var foundDomain string
-	for _, configuredDomain := range h.options.Domains {
-		configuredDotDomain := dns.Fqdn(configuredDomain)
-		if stringsutil.HasSuffixI(domain, configuredDotDomain) {
-			foundDomain = configuredDomain
-			break
-		}
-	}
+	foundDomain := h.matchingDomain(domain)
 
-	// if root-tld is enabled stores any interaction towards the main domain
+	host, _, _ := net.SplitHostPort(w.RemoteAddr().String())
+
 	if h.options.RootTLD && foundDomain != "" {
-		correlationID := foundDomain
-		host, _, _ := net.SplitHostPort(w.RemoteAddr().String())
 		interaction := &Interaction{
 			Protocol:      "dns",
 			UniqueID:      domain,
@@ -375,55 +380,18 @@ func (h *DNSServer) handleInteraction(domain string, w dns.ResponseWriter, r *dn
 			RemoteAddress: host,
 			Timestamp:     time.Now(),
 		}
-
-		if nil != h.options.OnResult {
+		if h.options.OnResult != nil {
 			h.options.OnResult(interaction)
 		}
-
-		data, err := jsoniter.Marshal(interaction)
-		if err != nil {
-			gologger.Warning().Msgf("Could not encode root tld dns interaction: %s\n", err)
-		} else {
-			gologger.Debug().Msgf("Root TLD DNS Interaction: \n%s\n", string(data))
-			if err := h.options.Storage.AddInteractionWithId(correlationID, data); err != nil {
-				gologger.Warning().Msgf("Could not store dns interaction: %s\n", err)
-			}
-		}
+		h.options.storeRootTLDInteraction(interaction, foundDomain)
 	}
 
-	if foundDomain != "" {
-		if h.options.ScanEverywhere {
-			chunks := stringsutil.SplitAny(requestMsg, ".\n\t\"'")
-			for _, chunk := range chunks {
-				for part := range stringsutil.SlideWithLength(chunk, h.options.GetIdLength()) {
-					normalizedPart := strings.ToLower(part)
-					if h.options.isCorrelationID(normalizedPart) {
-						uniqueID = normalizedPart
-						fullID = part
-					}
-				}
-			}
-		} else {
-			parts := strings.Split(domain, ".")
-			for i, part := range parts {
-				for partChunk := range stringsutil.SlideWithLength(part, h.options.GetIdLength()) {
-					normalizedPartChunk := strings.ToLower(partChunk)
-					if h.options.isCorrelationID(normalizedPartChunk) {
-						fullID = part
-						if i+1 <= len(parts) {
-							fullID = strings.Join(parts[:i+1], ".")
-						}
-						uniqueID = normalizedPartChunk
-					}
-				}
-			}
-		}
+	if foundDomain == "" {
+		return
 	}
 
-	if uniqueID != "" {
-		correlationID := uniqueID[:h.options.CorrelationIdLength]
-		host, _, _ := net.SplitHostPort(w.RemoteAddr().String())
-		interaction := &Interaction{
+	storeMatch := func(uniqueID, fullID string) {
+		h.options.storeInteraction(&Interaction{
 			Protocol:      "dns",
 			UniqueID:      uniqueID,
 			FullId:        fullID,
@@ -432,15 +400,34 @@ func (h *DNSServer) handleInteraction(domain string, w dns.ResponseWriter, r *dn
 			RawResponse:   responseMsg,
 			RemoteAddress: host,
 			Timestamp:     time.Now(),
-		}
-		data, err := jsoniter.Marshal(interaction)
-		if err != nil {
-			gologger.Warning().Msgf("Could not encode dns interaction: %s\n", err)
-		} else {
-			gologger.Debug().Msgf("DNS Interaction: \n%s\n", string(data))
-			if err := h.options.Storage.AddInteraction(correlationID, data); err != nil {
-				gologger.Warning().Msgf("Could not store dns interaction: %s\n", err)
+		}, uniqueID[:h.options.CorrelationIdLength])
+	}
+
+	if h.options.ScanEverywhere {
+		chunks := stringsutil.SplitAny(requestMsg, ".\n\t\"'")
+		for _, chunk := range chunks {
+			for part := range stringsutil.SlideWithLength(chunk, h.options.GetIdLength()) {
+				normalizedPart := strings.ToLower(part)
+				if h.options.isCorrelationID(normalizedPart) {
+					storeMatch(normalizedPart, part)
+				}
 			}
+		}
+		return
+	}
+
+	parts := strings.Split(domain, ".")
+	for i, part := range parts {
+		for partChunk := range stringsutil.SlideWithLength(part, h.options.GetIdLength()) {
+			normalizedPartChunk := strings.ToLower(partChunk)
+			if !h.options.isCorrelationID(normalizedPartChunk) {
+				continue
+			}
+			fullID := part
+			if i+1 <= len(parts) {
+				fullID = strings.Join(parts[:i+1], ".")
+			}
+			storeMatch(normalizedPartChunk, fullID)
 		}
 	}
 }

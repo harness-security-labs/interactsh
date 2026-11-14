@@ -8,9 +8,12 @@ import (
 	"crypto/rand"
 	"crypto/rsa"
 	"crypto/sha256"
+	"crypto/tls"
 	"crypto/x509"
 	"encoding/base64"
+	"encoding/json"
 	"encoding/pem"
+	"errors"
 	"fmt"
 	"io"
 	"net"
@@ -22,10 +25,7 @@ import (
 	"sync/atomic"
 	"time"
 
-	"errors"
-
 	"github.com/google/uuid"
-	jsoniter "github.com/json-iterator/go"
 	asnmap "github.com/projectdiscovery/asnmap/libs"
 	"github.com/projectdiscovery/gologger"
 	"github.com/projectdiscovery/interactsh/pkg/options"
@@ -68,6 +68,17 @@ type Client struct {
 	token                    string
 	correlationIdLength      int
 	CorrelationIdNonceLength int
+	logger                   *gologger.Logger
+	// capabilitiesKnown records that a registration response was received and
+	// parsed, which is what makes the absence of a capabilities block meaningful.
+	// A resumed session whose re-registration was refused because the session is
+	// still alive never learns what the server offers, and "unknown" must not be
+	// read as "the server offers nothing".
+	capabilitiesKnown atomic.Bool
+	// capabilities holds the *server.Capabilities advertised at registration.
+	// Written from performRegistration, which the keep-alive goroutine also
+	// calls, hence atomic.Value rather than a bare field.
+	capabilities atomic.Value
 }
 
 // Options contains configuration options for interactsh client
@@ -82,12 +93,16 @@ type Options struct {
 	CorrelationIdLength int
 	// CorrelationIdNonceLengthLength of the nonce
 	CorrelationIdNonceLength int
-	// HTTPClient use a custom http client
+	// HTTPClient use a custom http client. With INTERACTSH_TLS_VERIFY=true its
+	// custom TLS dialers (DialTLSContext, DialTLS) are removed, so trust roots
+	// and client certificates must be set in TLSClientConfig.
 	HTTPClient *retryablehttp.Client
 	// SessionInfo to resume an existing session
 	SessionInfo *options.SessionInfo
 	// keepAliveInterval to renew the session
 	KeepAliveInterval time.Duration
+	// Logger is an optional custom logger. If nil, gologger.DefaultLogger is used.
+	Logger *gologger.Logger
 }
 
 // DefaultOptions is the default options for the interact client
@@ -95,6 +110,24 @@ var DefaultOptions = &Options{
 	ServerURL:                "oast.pro,oast.live,oast.site,oast.online,oast.fun,oast.me",
 	CorrelationIdLength:      settings.CorrelationIdLengthDefault,
 	CorrelationIdNonceLength: settings.CorrelationIdNonceLengthDefault,
+}
+
+// verifyTLS returns a copy of t that verifies the server certificate. A custom
+// TLS dialer, such as the fastdialer one of retryablehttp, ignores
+// TLSClientConfig, so it is dropped: the copy dials with DialContext and does
+// the TLS handshake itself. The copy has its own connection pool, so no
+// connection from the old, unverified TLS setup is reused.
+func verifyTLS(t *http.Transport) (*http.Transport, error) {
+	if (t.DialTLSContext != nil || t.DialTLS != nil) && t.DialContext == nil && t.Dial == nil { //nolint:staticcheck // DialTLS and Dial are deprecated but still used
+		return nil, errors.New("tls enforced - transport has a custom TLS dialer only")
+	}
+	verifying := t.Clone()
+	verifying.DialTLSContext = nil
+	verifying.DialTLS = nil //nolint:staticcheck // DialTLS is deprecated but still used
+	if verifying.TLSClientConfig != nil {
+		verifying.TLSClientConfig.InsecureSkipVerify = false
+	}
+	return verifying, nil
 }
 
 // New creates a new client instance based on provided options
@@ -125,12 +158,36 @@ func New(options *Options) (*Client, error) {
 	}
 
 	// INTERACTSH_TLS_VERIFY enforces TLS (cleartext is a fatal error)
-	if os.Getenv("INTERACTSH_TLS_VERIFY") == "true" {
-		t, ok := httpclient.HTTPClient.Transport.(*http.Transport)
-		if !ok {
-			return nil, errors.New("could not get http transport")
+	tlsVerify := os.Getenv("INTERACTSH_TLS_VERIFY") == "true"
+	if tlsVerify {
+		var primaryTLS *tls.Config
+		for i, c := range []*http.Client{httpclient.HTTPClient, httpclient.HTTPClient2} {
+			if c == nil {
+				continue
+			}
+			t, ok := c.Transport.(*http.Transport)
+			if !ok {
+				return nil, errors.New("could not get http transport")
+			}
+			verifying, err := verifyTLS(t)
+			if err != nil {
+				return nil, err
+			}
+			// the fallback client trusts the same roots as the primary one
+			if i == 0 {
+				primaryTLS = verifying.TLSClientConfig
+			} else if primaryTLS != nil {
+				// copy only the trust material: the fallback keeps its own ALPN settings
+				if verifying.TLSClientConfig == nil {
+					verifying.TLSClientConfig = &tls.Config{}
+				}
+				verifying.TLSClientConfig.RootCAs = primaryTLS.RootCAs
+				verifying.TLSClientConfig.ServerName = primaryTLS.ServerName
+				verifying.TLSClientConfig.Certificates = primaryTLS.Certificates
+				verifying.TLSClientConfig.GetClientCertificate = primaryTLS.GetClientCertificate
+			}
+			c.Transport = verifying
 		}
-		t.TLSClientConfig.InsecureSkipVerify = false
 		if stringsutil.HasPrefixI(options.ServerURL, "http://") {
 			return nil, errors.New("tls enforced - invalid URL with cleartext http")
 		}
@@ -150,8 +207,17 @@ func New(options *Options) (*Client, error) {
 		secretKey = options.SessionInfo.SecretKey
 		token = options.SessionInfo.Token
 	} else {
-		// Generate a random ksuid which will be used as server secret.
-		correlationID = xid.New().String()
+		// Use a privacy-preserving xid: keep the 4-byte timestamp prefix so the id
+		// stays k-ordered and parseable, but randomize the trailing 8 bytes
+		// (machine + pid + counter). Plain xid.New() leaks a stable per-machine
+		// fingerprint (md5(hostname)[:3]) through every OAST callback, which is
+		// observable by the target service and by third-party telemetry that
+		// logs OAST traffic (see issue #1349).
+		anonID, err := newAnonymousCorrelationID()
+		if err != nil {
+			return nil, errkit.Wrap(err, "could not generate correlation id")
+		}
+		correlationID = anonID
 		if len(correlationID) > options.CorrelationIdLength {
 			correlationID = correlationID[:options.CorrelationIdLength]
 		}
@@ -159,17 +225,28 @@ func New(options *Options) (*Client, error) {
 		token = options.Token
 	}
 
+	logger := options.Logger
+	if logger == nil {
+		logger = gologger.DefaultLogger
+	}
+
 	client := &Client{
+		logger:                   logger,
 		secretKey:                secretKey,
 		correlationID:            correlationID,
 		httpClient:               httpclient,
 		token:                    token,
-		disableHTTPFallback:      options.DisableHTTPFallback,
+		disableHTTPFallback:      options.DisableHTTPFallback || tlsVerify,
 		correlationIdLength:      options.CorrelationIdLength,
 		CorrelationIdNonceLength: options.CorrelationIdNonceLength,
 	}
 
 	if options.SessionInfo != nil {
+		if tlsVerify {
+			if serverURL, err := parseServerURL(options.SessionInfo.ServerURL); err != nil || !strings.EqualFold(serverURL.Scheme, "https") || serverURL.Host == "" {
+				return nil, errors.New("tls enforced - session server URL is not https")
+			}
+		}
 		privKey, err := x509.ParsePKCS1PrivateKey([]byte(options.SessionInfo.PrivateKey))
 		if err == nil {
 			client.privKey = privKey
@@ -179,8 +256,10 @@ func New(options *Options) (*Client, error) {
 			return nil, errkit.Wrap(err, "failed to decode public key")
 		}
 		client.pubKey = pubKey
-		if serverURL, err := url.Parse(options.SessionInfo.ServerURL); err == nil {
+		registrationServerURL := options.SessionInfo.ServerURL
+		if serverURL, err := parseServerURL(options.SessionInfo.ServerURL); err == nil {
 			client.serverURL = serverURL
+			registrationServerURL = serverURL.String()
 		}
 		// attempts to re-register - server will reject is already existing
 		registrationRequest, err := encodeRegistrationRequest(options.SessionInfo.PublicKey, options.SessionInfo.SecretKey, options.SessionInfo.CorrelationID)
@@ -188,7 +267,7 @@ func New(options *Options) (*Client, error) {
 			return nil, err
 		}
 		// silently fails to re-register if the session is still alive
-		_ = client.performRegistration(options.SessionInfo.ServerURL, registrationRequest)
+		_ = client.performRegistration(registrationServerURL, registrationRequest)
 	} else {
 		payload, err := client.initializeRSAKeys()
 		if err != nil {
@@ -261,7 +340,7 @@ func encodeRegistrationRequest(publicKey, secretkey, correlationID string) ([]by
 		CorrelationID: correlationID,
 	}
 
-	data, err := jsoniter.Marshal(register)
+	data, err := json.Marshal(register)
 	if err != nil {
 		return nil, errkit.Wrap(err, "could not marshal register request")
 	}
@@ -319,11 +398,11 @@ func (c *Client) parseServerURLs(serverURL string, payload []byte) error {
 	}
 
 	values := strings.Split(serverURL, ",")
-	registerFunc := func(idx int, value string) error {
+	registerFunc := func(_ int, value string) error {
 		if !stringsutil.HasPrefixAny(value, "http://", "https://") {
 			value = fmt.Sprintf("https://%s", value)
 		}
-		parsed, err := url.Parse(value)
+		parsed, err := parseServerURL(value)
 		if err != nil {
 			return errkit.Wrap(err, "could not parse server URL")
 		}
@@ -331,7 +410,7 @@ func (c *Client) parseServerURLs(serverURL string, payload []byte) error {
 		if err := c.performRegistration(parsed.String(), payload); err != nil {
 			if !c.disableHTTPFallback && parsed.Scheme == "https" {
 				parsed.Scheme = "http"
-				gologger.Verbose().Msgf("Could not register to %s: %s, retrying with http\n", parsed.String(), err)
+				c.logger.Verbose().Msgf("Could not register to %s: %s, retrying with http\n", parsed.String(), err)
 				goto makeReq
 			}
 			return err
@@ -348,7 +427,7 @@ func (c *Client) parseServerURLs(serverURL string, payload []byte) error {
 		}
 		err := registerFunc(index, item)
 		if err != nil {
-			gologger.Verbose().Msgf("Could not register to %s: %s, retrying with remaining\n", item, err)
+			c.logger.Verbose().Msgf("Could not register to %s: %s, retrying with remaining\n", item, err)
 			registerErrors = append(registerErrors, err)
 		}
 		return nil
@@ -359,6 +438,20 @@ func (c *Client) parseServerURLs(serverURL string, payload []byte) error {
 	}
 
 	return nil
+}
+
+func parseServerURL(value string) (*url.URL, error) {
+	parsed, err := url.Parse(value)
+	if err != nil {
+		return nil, err
+	}
+
+	for strings.HasSuffix(parsed.EscapedPath(), "/") {
+		parsed.Path = strings.TrimSuffix(parsed.Path, "/")
+		parsed.RawPath = strings.TrimSuffix(parsed.RawPath, "/")
+	}
+
+	return parsed, nil
 }
 
 // InteractionCallback is a callback function for a reported interaction
@@ -389,9 +482,9 @@ func (c *Client) StartPolling(duration time.Duration, callback InteractionCallba
 				err := c.getInteractions(callback)
 				if err != nil {
 					if errkit.Is(err, errAuth) {
-						gologger.Error().Msgf("Could not authenticate to the server %v", err)
+						c.logger.Error().Msgf("Could not authenticate to the server %v", err)
 					} else if errkit.Is(err, storage.ErrCorrelationIdNotFound) {
-						gologger.Error().Msgf("The correlation id was not found (probably evicted due to inactivity): %v", err)
+						c.logger.Error().Msgf("The correlation id was not found (probably evicted due to inactivity): %v", err)
 					}
 				}
 			case <-c.quitChan:
@@ -448,21 +541,21 @@ func (c *Client) getInteractions(callback InteractionCallback) error {
 		return fmt.Errorf("could not poll interactions: %s", string(data))
 	}
 	response := &server.PollResponse{}
-	if err := jsoniter.NewDecoder(resp.Body).Decode(response); err != nil {
-		gologger.Error().Msgf("Could not decode interactions: %v\n", err)
+	if err := json.NewDecoder(resp.Body).Decode(response); err != nil {
+		c.logger.Error().Msgf("Could not decode interactions: %v\n", err)
 		return err
 	}
 
 	for _, data := range response.Data {
 		plaintext, err := c.decryptMessage(response.AESKey, data)
 		if err != nil {
-			gologger.Error().Msgf("Could not decrypt interaction: %v\n", err)
+			c.logger.Error().Msgf("Could not decrypt interaction: %v\n", err)
 			continue
 		}
 		plaintext = bytes.TrimRight(plaintext, " \t\r\n")
 		interaction := &server.Interaction{}
-		if err := jsoniter.Unmarshal(plaintext, interaction); err != nil {
-			gologger.Error().Msgf("Could not unmarshal interaction data interaction: %v\n", err)
+		if err := json.Unmarshal(plaintext, interaction); err != nil {
+			c.logger.Error().Msgf("Could not unmarshal interaction data interaction: %v\n", err)
 			continue
 		}
 		callback(interaction)
@@ -470,8 +563,8 @@ func (c *Client) getInteractions(callback InteractionCallback) error {
 
 	for _, plaintext := range response.Extra {
 		interaction := &server.Interaction{}
-		if err := jsoniter.UnmarshalFromString(plaintext, interaction); err != nil {
-			gologger.Error().Msgf("Could not unmarshal interaction data interaction: %v\n", err)
+		if err := json.Unmarshal([]byte(plaintext), interaction); err != nil {
+			c.logger.Error().Msgf("Could not unmarshal interaction data interaction: %v\n", err)
 			continue
 		}
 		callback(interaction)
@@ -483,8 +576,8 @@ func (c *Client) getInteractions(callback InteractionCallback) error {
 			continue
 		}
 		interaction := &server.Interaction{}
-		if err := jsoniter.UnmarshalFromString(data, interaction); err != nil {
-			gologger.Error().Msgf("Could not unmarshal interaction data interaction: %v\n", err)
+		if err := json.Unmarshal([]byte(data), interaction); err != nil {
+			c.logger.Error().Msgf("Could not unmarshal interaction data interaction: %v\n", err)
 			continue
 		}
 		callback(interaction)
@@ -555,7 +648,7 @@ func (c *Client) Close() error {
 		CorrelationID: c.correlationID,
 		SecretKey:     c.secretKey,
 	}
-	data, err := jsoniter.Marshal(register)
+	data, err := json.Marshal(register)
 	if err != nil {
 		return errkit.Wrap(err, "could not marshal deregister request")
 	}
@@ -624,21 +717,40 @@ func (c *Client) performRegistration(serverURL string, payload []byte) error {
 		data, _ := io.ReadAll(resp.Body)
 		return fmt.Errorf("could not register to server: %s", string(data))
 	}
-	response := make(map[string]interface{})
-	if err := jsoniter.NewDecoder(resp.Body).Decode(&response); err != nil {
+	response := &server.RegisterResponse{}
+	if err := json.NewDecoder(resp.Body).Decode(response); err != nil {
 		return errkit.Wrap(err, "could not register to server")
 	}
-	message, ok := response["message"]
-	if !ok {
+	if response.Message == "" {
 		return errors.New("could not get register response")
 	}
-	if message.(string) != "registration successful" {
-		return fmt.Errorf("could not get register response: %s", message.(string))
+	if response.Message != "registration successful" {
+		return fmt.Errorf("could not get register response: %s", response.Message)
+	}
+
+	// A successful registration is authoritative about what the server offers,
+	// including the absence of a capabilities block, which means the server
+	// predates them.
+	c.capabilitiesKnown.Store(true)
+	if response.Capabilities != nil {
+		c.capabilities.Store(response.Capabilities)
 	}
 
 	c.State.Store(Idle)
 
 	return nil
+}
+
+// CapabilitiesKnown reports whether a registration response has been received,
+// which is what distinguishes a server that advertised no capabilities from a
+// resumed session that never got to ask.
+func (c *Client) CapabilitiesKnown() bool { return c.capabilitiesKnown.Load() }
+
+// Capabilities returns the optional features advertised by the server at
+// registration, or nil if the server did not advertise any.
+func (c *Client) Capabilities() *server.Capabilities {
+	caps, _ := c.capabilities.Load().(*server.Capabilities)
+	return caps
 }
 
 // URL returns a new URL that can be used for external interaction requests.
@@ -720,4 +832,19 @@ func (c *Client) SaveSessionTo(filename string) error {
 		return err
 	}
 	return os.WriteFile(filename, data, os.ModePerm)
+}
+
+// newAnonymousCorrelationID returns an xid-formatted correlation id that
+// preserves the 4-byte timestamp prefix (for k-ordering and the server-side
+// xidAlphabet validator) and replaces the remaining 8 bytes (machine, pid,
+// counter) with crypto/rand. The result is still a valid xid string, still
+// 20 chars from the [0-9a-v] alphabet, and still parseable with xid.FromString.
+func newAnonymousCorrelationID() (string, error) {
+	id := xid.NewWithTime(time.Now())
+	// Overwrite machine (4..6), pid (7..8), counter (9..11) with random bytes.
+	// id is xid.ID ([12]byte) and id[4:] aliases the same backing array.
+	if _, err := rand.Read(id[4:]); err != nil {
+		return "", err
+	}
+	return id.String(), nil
 }
