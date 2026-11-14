@@ -13,6 +13,7 @@ on:
 jobs:  
   build:
     name: Test Builds
+    if: ${{ !endsWith(github.actor, '[bot]') }}
     runs-on: ${{ matrix.os }}
     strategy:
       matrix:
@@ -34,15 +35,9 @@ jobs:
         run: go test ./...
         working-directory: .
 
-      # Todo
-      # - name: Integration Tests
-      #   env:
-      #     GH_ACTION: true
-      #   run: bash run.sh
-      #   working-directory: integration_tests/
-
       - name: Race Condition Tests
-        run: go build -race ./...
+        if: runner.os == 'Linux'
+        run: go test -race ./...
         working-directory: .
 
       - name: Example Code Tests

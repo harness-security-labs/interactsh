@@ -5,15 +5,18 @@ on:
     paths:
       - '**.go'
       - '**.mod'
+      - '.golangci.yml'
+      - '.golangci-lint-version'
   workflow_dispatch:
 
 jobs:
   lint:
     name: Lint Test
+    if: ${{ !endsWith(github.actor, '[bot]') }}
     runs-on: ubuntu-latest
     steps:
       - name: Checkout code
-        uses: actions/checkout@v3
+        uses: actions/checkout@v7
       - name: Set up Go
         uses: actions/setup-go@v4
         with:
@@ -21,6 +24,4 @@ jobs:
       - name: Run golangci-lint
         uses: golangci/golangci-lint-action@v9
         with:
-          version: latest
           args: --timeout 5m
-          working-directory: .

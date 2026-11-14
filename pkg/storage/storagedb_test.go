@@ -134,11 +134,14 @@ func doStuffWithOtherCache(cache cache.Cache) {
 	}
 }
 
+// TestGetInteractionsWithIdForConsumer verifies per-consumer interaction polling and compaction behavior.
 func TestGetInteractionsWithIdForConsumer(t *testing.T) {
 	t.Run("two consumers independently receive all interactions", func(t *testing.T) {
 		mem, err := New(&Options{EvictionTTL: 1 * time.Hour})
 		require.NoError(t, err)
-		defer mem.Close()
+		defer func() {
+			_ = mem.Close()
+		}()
 
 		require.NoError(t, mem.SetID("shared"))
 		require.NoError(t, mem.AddInteractionWithId("shared", []byte("interaction-1")))
@@ -156,7 +159,9 @@ func TestGetInteractionsWithIdForConsumer(t *testing.T) {
 	t.Run("subsequent poll returns only unseen data", func(t *testing.T) {
 		mem, err := New(&Options{EvictionTTL: 1 * time.Hour})
 		require.NoError(t, err)
-		defer mem.Close()
+		defer func() {
+			_ = mem.Close()
+		}()
 
 		require.NoError(t, mem.SetID("shared"))
 		require.NoError(t, mem.AddInteractionWithId("shared", []byte("msg-1")))
@@ -182,7 +187,9 @@ func TestGetInteractionsWithIdForConsumer(t *testing.T) {
 	t.Run("empty poll returns nil", func(t *testing.T) {
 		mem, err := New(&Options{EvictionTTL: 1 * time.Hour})
 		require.NoError(t, err)
-		defer mem.Close()
+		defer func() {
+			_ = mem.Close()
+		}()
 
 		require.NoError(t, mem.SetID("shared"))
 
@@ -194,7 +201,9 @@ func TestGetInteractionsWithIdForConsumer(t *testing.T) {
 	t.Run("RemoveConsumer compacts data read by remaining consumers", func(t *testing.T) {
 		mem, err := New(&Options{EvictionTTL: 1 * time.Hour})
 		require.NoError(t, err)
-		defer mem.Close()
+		defer func() {
+			_ = mem.Close()
+		}()
 
 		require.NoError(t, mem.SetID("shared"))
 		require.NoError(t, mem.AddInteractionWithId("shared", []byte("msg-1")))
@@ -221,7 +230,9 @@ func TestGetInteractionsWithIdForConsumer(t *testing.T) {
 	t.Run("RemoveConsumer partial compaction", func(t *testing.T) {
 		mem, err := New(&Options{EvictionTTL: 1 * time.Hour})
 		require.NoError(t, err)
-		defer mem.Close()
+		defer func() {
+			_ = mem.Close()
+		}()
 
 		require.NoError(t, mem.SetID("shared"))
 		for i := range 5 {
@@ -254,7 +265,9 @@ func TestGetInteractionsWithIdForConsumer(t *testing.T) {
 		// Use long cache TTL but short consumer staleness check
 		mem, err := New(&Options{EvictionTTL: 1 * time.Hour})
 		require.NoError(t, err)
-		defer mem.Close()
+		defer func() {
+			_ = mem.Close()
+		}()
 
 		require.NoError(t, mem.SetID("shared"))
 		require.NoError(t, mem.AddInteractionWithId("shared", []byte("msg-1")))
@@ -287,7 +300,9 @@ func TestGetInteractionsWithIdForConsumer(t *testing.T) {
 		bufferCap := 100
 		mem, err := New(&Options{EvictionTTL: 1 * time.Hour, MaxSharedInteractions: bufferCap})
 		require.NoError(t, err)
-		defer mem.Close()
+		defer func() {
+			_ = mem.Close()
+		}()
 
 		require.NoError(t, mem.SetID("shared"))
 
@@ -311,7 +326,9 @@ func TestGetInteractionsWithIdForConsumer(t *testing.T) {
 	t.Run("RemoveConsumer last consumer discards all data", func(t *testing.T) {
 		mem, err := New(&Options{EvictionTTL: 1 * time.Hour})
 		require.NoError(t, err)
-		defer mem.Close()
+		defer func() {
+			_ = mem.Close()
+		}()
 
 		require.NoError(t, mem.SetID("shared"))
 		require.NoError(t, mem.AddInteractionWithId("shared", []byte("msg-1")))
@@ -331,12 +348,15 @@ func TestGetInteractionsWithIdForConsumer(t *testing.T) {
 	})
 }
 
+// TestSlidingEvictionStrategy verifies cache entries expire after TTL from last access.
 func TestSlidingEvictionStrategy(t *testing.T) {
 	testTTL := 100 * time.Millisecond
 	smallDelay := 10 * time.Millisecond
 	mem, err := New(&Options{EvictionTTL: testTTL, EvictionStrategy: EvictionStrategySliding})
 	require.Nil(t, err)
-	defer mem.Close()
+	defer func() {
+		_ = mem.Close()
+	}()
 
 	err = mem.SetID("test-sliding")
 	require.Nil(t, err)
@@ -357,11 +377,14 @@ func TestSlidingEvictionStrategy(t *testing.T) {
 	require.False(t, ok)
 }
 
+// TestFixedEvictionStrategy verifies cache entries expire after TTL from initial insertion.
 func TestFixedEvictionStrategy(t *testing.T) {
 	testTTL := 100 * time.Millisecond
 	mem, err := New(&Options{EvictionTTL: testTTL, EvictionStrategy: EvictionStrategyFixed})
 	require.Nil(t, err)
-	defer mem.Close()
+	defer func() {
+		_ = mem.Close()
+	}()
 
 	err = mem.SetID("test-fixed")
 	require.Nil(t, err)
@@ -375,4 +398,28 @@ func TestFixedEvictionStrategy(t *testing.T) {
 	time.Sleep(testTTL / 2 + 10 * time.Millisecond)
 	_, ok = mem.cache.GetIfPresent("test-fixed")
 	require.False(t, ok)
+}
+func TestEmptySecretRejectedForSharedBuckets(t *testing.T) {
+	mem, err := New(&Options{EvictionTTL: time.Hour})
+	require.Nil(t, err)
+	defer func() {
+		_ = mem.Close()
+	}()
+
+	sharedID := "shared-bucket"
+	require.NoError(t, mem.SetID(sharedID))
+
+	// GetInteractions with empty secret must fail
+	_, _, err = mem.GetInteractions(sharedID, "")
+	require.Error(t, err, "empty secret must not allow polling shared bucket")
+
+	// RemoveID with empty secret must fail
+	err = mem.RemoveID(sharedID, "")
+	require.Error(t, err, "empty secret must not allow deregistering shared bucket")
+
+	// UpdateUploads with empty secret must fail
+	err = mem.UpdateUploads(sharedID, "", func(f []UploadedFile) ([]UploadedFile, error) {
+		return f, nil
+	})
+	require.ErrorIs(t, err, ErrInvalidSecretKey, "empty secret must not allow uploads to shared bucket")
 }

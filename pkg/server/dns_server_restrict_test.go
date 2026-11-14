@@ -5,6 +5,7 @@ import (
 	"testing"
 
 	"github.com/miekg/dns"
+	"github.com/projectdiscovery/interactsh/pkg/settings"
 	"github.com/stretchr/testify/require"
 )
 
@@ -63,7 +64,7 @@ func TestServeDNSRefusesOutOfZoneQuery(t *testing.T) {
 func TestServeDNSAnswersInZoneQuery(t *testing.T) {
 	opts := newTestOptions([]string{"192.0.2.1"}, "127.0.0.1")
 	opts.RestrictToDomains = true
-	opts.CorrelationIdLength = 20
+	opts.CorrelationIdLength = settings.CorrelationIdLengthDefault
 	opts.Stats = &Metrics{}
 	dnsServer := NewDNSServer("udp", opts)
 
@@ -82,7 +83,7 @@ func TestServeDNSAnswersInZoneQuery(t *testing.T) {
 func TestServeDNSRestrictionDisabledPreservesLegacyBehaviour(t *testing.T) {
 	opts := newTestOptions([]string{"192.0.2.1"}, "127.0.0.1")
 	opts.RestrictToDomains = false
-	opts.CorrelationIdLength = 20
+	opts.CorrelationIdLength = settings.CorrelationIdLengthDefault
 	opts.Stats = &Metrics{}
 	dnsServer := NewDNSServer("udp", opts)
 
@@ -114,7 +115,7 @@ func TestServeDNSAnswersArbitrarySubdomains(t *testing.T) {
 		opts := newTestOptions([]string{"54.245.113.160"}, "127.0.0.1")
 		opts.Domains = []string{"app.mydomain.com"}
 		opts.RestrictToDomains = true
-		opts.CorrelationIdLength = 20
+		opts.CorrelationIdLength = settings.CorrelationIdLengthDefault
 		opts.Stats = &Metrics{}
 		dnsServer := NewDNSServer("udp", opts)
 
@@ -138,7 +139,7 @@ func TestServeDNSAnswersSubdomainsForAllRecordTypes(t *testing.T) {
 		opts := newTestOptions([]string{"54.245.113.160"}, "127.0.0.1")
 		opts.Domains = []string{"app.mydomain.com"}
 		opts.RestrictToDomains = true
-		opts.CorrelationIdLength = 20
+		opts.CorrelationIdLength = settings.CorrelationIdLengthDefault
 		opts.Stats = &Metrics{}
 		dnsServer := NewDNSServer("udp", opts)
 
@@ -159,7 +160,7 @@ func TestServeDNSRefusesMixedInAndOutOfZoneQuestions(t *testing.T) {
 	opts := newTestOptions([]string{"54.245.113.160"}, "127.0.0.1")
 	opts.Domains = []string{"app.mydomain.com"}
 	opts.RestrictToDomains = true
-	opts.CorrelationIdLength = 20
+	opts.CorrelationIdLength = settings.CorrelationIdLengthDefault
 	opts.Stats = &Metrics{}
 	dnsServer := NewDNSServer("udp", opts)
 
