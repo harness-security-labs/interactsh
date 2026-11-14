@@ -2,6 +2,7 @@ package acme
 
 import (
 	"context"
+	"fmt"
 	"os"
 	"path/filepath"
 	"testing"
@@ -11,6 +12,12 @@ import (
 	"github.com/libdns/libdns"
 	"github.com/stretchr/testify/require"
 )
+
+func TestCertNotReadyMatchesCertificateDownload404(t *testing.T) {
+	require.True(t, certNotReady(fmt.Errorf("HTTP 404 urn:ietf:params:acme:error:malformed - Certificate not found")))
+	require.False(t, certNotReady(fmt.Errorf("authorization failed")))
+	require.False(t, certNotReady(nil))
+}
 
 func TestUseSharedStorageDisabledKeepsMemoryProvider(t *testing.T) {
 	provider, err := UseSharedStorage("  ")
