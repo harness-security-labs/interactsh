@@ -2,12 +2,12 @@ package client
 
 import (
 	"bytes"
-	"github.com/projectdiscovery/gologger"
-	"github.com/projectdiscovery/gologger/formatter"
-	"github.com/projectdiscovery/gologger/levels"
 	"crypto/x509"
 	"encoding/json"
 	"fmt"
+	"github.com/projectdiscovery/gologger"
+	"github.com/projectdiscovery/gologger/formatter"
+	"github.com/projectdiscovery/gologger/levels"
 	"net/http"
 	"net/http/httptest"
 	"sync/atomic"
@@ -97,6 +97,18 @@ func TestNewAcceptsServerURLWithOptionalTrailingSlash(t *testing.T) {
 		require.NoError(t, resumedClient.getInteractions(func(*server.Interaction) {}))
 		require.NoError(t, resumedClient.Close())
 	})
+}
+
+func TestPerformRegistrationPreservesPollingState(t *testing.T) {
+	testServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		_, _ = w.Write([]byte(`{"message":"registration successful"}`))
+	}))
+	t.Cleanup(testServer.Close)
+
+	interactshClient := &Client{httpClient: retryablehttp.NewClient(retryablehttp.DefaultOptionsSingle)}
+	interactshClient.State.Store(Polling)
+	require.NoError(t, interactshClient.performRegistration(testServer.URL+"/register", []byte(`{}`)))
+	require.Equal(t, Polling, interactshClient.State.Load())
 }
 
 type testBufferWriter struct {

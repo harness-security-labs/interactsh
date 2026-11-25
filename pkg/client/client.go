@@ -736,7 +736,9 @@ func (c *Client) performRegistration(serverURL string, payload []byte) error {
 		c.capabilities.Store(response.Capabilities)
 	}
 
-	c.State.Store(Idle)
+	if c.State.Load() != Polling {
+		c.State.Store(Idle)
+	}
 
 	return nil
 }

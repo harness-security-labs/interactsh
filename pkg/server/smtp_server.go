@@ -44,6 +44,7 @@ func NewSMTPServer(options *Options) (*SMTPServer, error) {
 // ListenAndServe listens on smtp and/or smtps ports for the server.
 func (h *SMTPServer) ListenAndServe(tlsConfig *tls.Config, smtpAlive, smtpsAlive chan bool) {
 	if tlsConfig != nil {
+		h.smtpsServer.TLSConfig = tlsConfig
 		h.smtpAutoTLSServer.TLSConfig = tlsConfig
 		go func() {
 			smtpsAlive <- true
